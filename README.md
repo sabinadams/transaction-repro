@@ -1,228 +1,62 @@
-# Simple TypeScript Script Example
+# Reproduction of an issue
 
-This example shows how to use [Prisma Client](https://www.prisma.io/docs/reference/tools-and-interfaces/prisma-client) in a **simple TypeScript script** to read and write data in a SQLite database. You can find the database file with some dummy data at [`./prisma/dev.db`](./prisma/dev.db).
+The issue [here](https://github.com/prisma/prisma/issues/19145) here describes unexpected behavioral differences between Array transactions and Interactive transactions when a middleware is involved.
 
-## Getting started
-
-### 1. Download example and install dependencies
-
-Download this example:
-
-```
-npx try-prisma@latest --template typescript/script
-```
-
-Install npm dependencies:
-
-```
-cd script
-npm install
-```
-
-<details><summary><strong>Alternative:</strong> Clone the entire repo</summary>
-
-Clone this repository:
-
-```
-git clone git@github.com:prisma/prisma-examples.git --depth=1
-```
-
-Install npm dependencies:
-
-```
-cd prisma-examples/typescript/script
-npm install
-```
-
-</details>
-
-### 2. Create the database
-
-Run the following command to create your SQLite database file. This also creates the `User` and `Post` tables that are defined in [`prisma/schema.prisma`](./prisma/schema.prisma):
-
-```
-npx prisma migrate dev --name init
-```
-
-### 3. Run the script
-
-Execute the script with this command: 
-
-```
-npm run dev
-```
-
-## Evolving the app
-
-Evolving the application typically requires two steps:
-
-1. Migrate your database using Prisma Migrate
-1. Update your application code
-
-For the following example scenario, assume you want to add a "profile" feature to the app where users can create a profile and write a short bio about themselves.
-
-### 1. Migrate your database using Prisma Migrate
-
-The first step is to add a new table, e.g. called `Profile`, to the database. You can do this by adding a new model to your [Prisma schema file](./prisma/schema.prisma) file and then running a migration afterwards:
-
-```diff
-// schema.prisma
-
-model Post {
-  id        Int     @default(autoincrement()) @id
-  title     String
-  content   String?
-  published Boolean @default(false)
-  author    User?   @relation(fields: [authorId], references: [id])
-  authorId  Int
-}
-
-model User {
-  id      Int      @default(autoincrement()) @id 
-  name    String? 
-  email   String   @unique
-  posts   Post[]
-+ profile Profile?
-}
-
-+model Profile {
-+  id     Int     @default(autoincrement()) @id
-+  bio    String?
-+  userId Int     @unique
-+  user   User    @relation(fields: [userId], references: [id])
-+}
-```
-
-Once you've updated your data model, you can execute the changes against your database with the following command:
-
-```
-npx prisma migrate dev
-```
-
-### 2. Update your application code
-
-You can now use your `PrismaClient` instance to perform operations against the new `Profile` table. Here are some examples:
-
-#### Create a new profile for an existing user
+The Tl;dr of the problem is that the following results in two different behaviors:
 
 ```ts
-const profile = await prisma.profile.create({
-  data: {
-    bio: "Hello World",
-    user: {
-      connect: { email: "alice@prisma.io" },
-    },
-  },
-});
+import { PrismaClient } from "@prisma/client";
+import { retryMiddleware } from "./middleware";
+const db = new PrismaClient();
+db.$use(retryMiddleware);
+
+// array
+await db.$transaction([
+  createARecord, 
+  failAQuery
+])
+// itx
+await db.$transaction((tx) => {
+  await createARecord()
+  await failAQuery()
+})
 ```
 
-#### Create a new user with a new profile
+The array-based transaction leaves one record in the database when you would expect the failure to roll back any data changes.
 
-```ts
-const user = await prisma.user.create({
-  data: {
-    email: "john@prisma.io",
-    name: "John",
-    profile: {
-      create: {
-        bio: "Hello World",
-      },
-    },
-  },
-});
-```
+The interactive transaction correctly rolls back the changes.
 
-#### Update the profile of an existing user
+## Findings
 
-```ts
-const userWithUpdatedProfile = await prisma.user.update({
-  where: { email: "alice@prisma.io" },
-  data: {
-    profile: {
-      update: {
-        bio: "Hello Friends",
-      },
-    },
-  },
-});
-```
+In this repo I have set up two tests.
 
+> **Note**
+> To run the tests, run `npm run test:ui`. If prompted to, install `@vitest/ui` by selecting `'y'` and run the command again.
 
-## Switch to another database (e.g. PostgreSQL, MySQL, SQL Server, MongoDB)
+I've added logging in the middleware to log each attempt and an indicator about whether or not that attempt passed. It then logs the entire table to see if any data is left.
 
-If you want to try this example with another database than SQLite, you can adjust the the database connection in [`prisma/schema.prisma`](./prisma/schema.prisma) by reconfiguring the `datasource` block. 
+### Interactive Transaction
 
-Learn more about the different connection configurations in the [docs](https://www.prisma.io/docs/reference/database-reference/connection-urls).
+![](./images/itx.png)
 
-<details><summary>Expand for an overview of example configurations with different databases</summary>
+We can see here the successful attempt passes.
 
-### PostgreSQL
+Next, the failure-inducing invocation occurs triggering a retry. These happen until the retry limit is reached and the function fails. 
 
-For PostgreSQL, the connection URL has the following structure:
+The table at the end shows no records, indicating the rollback was successful.
+### Array Transaction
+![](./images/array.png)
 
-```prisma
-datasource db {
-  provider = "postgresql"
-  url      = "postgresql://USER:PASSWORD@HOST:PORT/DATABASE?schema=SCHEMA"
-}
-```
+When using an array transaction, we can see rather than running the first function, checking if it was successful and then moving on to the next one, it actually runs _BOTH_ functions on attempt 1. 
 
-Here is an example connection string with a local PostgreSQL database:
+The second function of attempt 1 fails, so both are considered failed. It then moves on to attempt 2. 
 
-```prisma
-datasource db {
-  provider = "postgresql"
-  url      = "postgresql://janedoe:mypassword@localhost:5432/notesapi?schema=public"
-}
-```
+There, it begins to behave differently. Attempt 2 with a proper name actually succeeds and the one with no name fails. We see only one failure. 
 
-### MySQL
+That failed one continues to retry until the retry limit is reached.
 
-For MySQL, the connection URL has the following structure:
+Because Attempt 2 did have a successful run, that record is still in the database. No rollback occurred there (_BAD_).
 
-```prisma
-datasource db {
-  provider = "mysql"
-  url      = "mysql://USER:PASSWORD@HOST:PORT/DATABASE"
-}
-```
+## Theories
 
-Here is an example connection string with a local MySQL database:
-
-```prisma
-datasource db {
-  provider = "mysql"
-  url      = "mysql://janedoe:mypassword@localhost:3306/notesapi"
-}
-```
-
-### Microsoft SQL Server
-
-Here is an example connection string with a local Microsoft SQL Server database:
-
-```prisma
-datasource db {
-  provider = "sqlserver"
-  url      = "sqlserver://localhost:1433;initial catalog=sample;user=sa;password=mypassword;"
-}
-```
-
-### MongoDB
-
-Here is an example connection string with a local MongoDB database:
-
-```prisma
-datasource db {
-  provider = "mongodb"
-  url      = "mongodb://USERNAME:PASSWORD@HOST/DATABASE?authSource=admin&retryWrites=true&w=majority"
-}
-```
-
-</details>
-
-## Next steps
-
-- Check out the [Prisma docs](https://www.prisma.io/docs)
-- Share your feedback in the [`#product-wishlist`](https://prisma.slack.com/messages/CKQTGR6T0/) channel on the [Prisma Slack](https://slack.prisma.io/)
-- Create issues and ask questions on [GitHub](https://github.com/prisma/prisma/)
-- Watch our biweekly "What's new in Prisma" livestreams on [Youtube](https://www.youtube.com/channel/UCptAHlN1gdwD89tFM3ENb6w)
+When using array transactions in a middleware, both functions are not depend on each other's success after the first attempt. 
