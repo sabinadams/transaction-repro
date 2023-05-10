@@ -2,7 +2,8 @@
   "name": "script",
   "license": "MIT",
   "scripts": {
-    "dev": "ts-node ./src/index.ts",
+    "dev:mw": "ts-node ./src/index.middleware.ts",
+    "dev:ex": "ts-node ./src/index.extension.ts",
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:run": "vitest run"
